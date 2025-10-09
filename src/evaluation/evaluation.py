@@ -137,14 +137,15 @@ def evaluate_single_query(
                 except Exception:
                     answer_type = None
                     response_type = None
-                answer_df[col] = answer_df[col].astype(str)
-                if (response_type is float and answer_type is int) or (
-                    response_type is int and answer_type is float
+                if (response_type == float and answer_type == int) or (
+                    response_type == int and answer_type == float
                 ):
-                    if response_type is int:
+                    if response_type == int:
                         response_df[col] = response_df[col].astype(float)
-                    elif answer_type is int:
+                    elif answer_type == int:
                         answer_df[col] = answer_df[col].astype(float)
+
+                answer_df[col] = answer_df[col].astype(str)
                 response_df[col] = response_df[col].astype(str)
             response_df.drop_duplicates(subset=unique_columns, inplace=True)
             answer_df.drop_duplicates(subset=unique_columns, inplace=True)
