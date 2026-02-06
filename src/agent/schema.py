@@ -37,6 +37,7 @@ class ToolCallResultDict(TypedDict):
     data: str | None
     error: str | None
     system_error: str | None
+    extra: dict[str, Any] | None
 
 
 @dataclass
@@ -79,6 +80,8 @@ class LLMOutputItem:
     content: str | None = None
     """The content of the output item."""
 
+    reasoning_details: Any | None = None
+
     reasoning_content: str | None = None
     """The reasoning content of the output item."""
 
@@ -109,6 +112,8 @@ class RunResult:
 
     content: str | None = None
     """The content of the output item."""
+
+    reasoning_details: Any | None = None
 
     reasoning_content: str | None = None
     """The reasoning content of the output item."""

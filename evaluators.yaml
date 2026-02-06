@@ -1,0 +1,26 @@
+models:
+  - name: google/gemini-3-flash-preview
+    temperature: 1.0
+    base_url: https://openrouter.ai/api/v1
+    api_key: "${OPENROUTER_API_KEY}"
+    extra_body: {"reasoning": {"effort": "minimal"}}
+    max_tokens: 60000
+
+  - name: deepseek-chat
+    temperature: 0.0
+    base_url: https://api.deepseek.com
+    api_key: "${DEEPSEEK_API_KEY}"
+    max_tokens: 8000
+
+  - name: glm-4.7
+    temperature: 0.0
+    base_url: https://open.bigmodel.cn/api/paas/v4
+    api_key: "${GLM_API_KEY}" 
+    extra_body: {"thinking": {"type": "disabled"}}
+    max_tokens: 30000
+
+  - name: kimi-k2.5
+    temperature: 1.0
+    base_url: https://api.moonshot.cn/v1
+    api_key: "${MOONSHOT_API_KEY}"
+    extra_body: {"thinking": {"type": "enabled"}}

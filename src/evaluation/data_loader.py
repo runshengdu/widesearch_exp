@@ -21,7 +21,7 @@ import os
 import re
 from dataclasses import asdict, dataclass
 from io import StringIO
-from typing import Optional
+from typing import Any, Optional
 
 import pandas as pd
 from datasets import load_dataset
@@ -144,8 +144,18 @@ class WideSearchDataLoaderHF:
 class WideSearchResponse:
     instance_id: str
     response: str
+
+    assistant_message_count: Optional[int] = None
+    tool_call_counts: Optional[dict[str, int]] = None
+
     messages: Optional[list[dict]] = None
     trial_idx: Optional[int] = None
+
+    turn_count: Optional[int] = None
+    action_step_count: Optional[int] = None
+    llm_calls: Optional[list[dict[str, Any]]] = None
+    prompt_tokens_total: Optional[int] = None
+    completion_tokens_total: Optional[int] = None
 
     def extract_dataframe(self) -> pd.DataFrame | None:
         response_df = None

@@ -55,23 +55,22 @@ Current research primarily focuses on "deep" tasks. DeepSearch tackles the "I ca
 In sharp contrast, WideSearch tackles the "I could do it, but the sheer volume is overwhelming" problem. It requires agents to systematically find and organize large-scale information into a structured output, shifting the primary challenge from deep search to achieving exhaustiveness and fidelity at scale.
 
 ## Experiments
-We test both single-agent and multi-agent modes, and manually conducted end-to-end testing of the commercial AI system on the web interface. In addition, we randomly select 20 questions and invited human annotators to perform tests. The experiment results are as follows:
+We test the single-agent mode, and manually conducted end-to-end testing of the commercial AI system on the web interface. In addition, we randomly select 20 questions and invited human annotators to perform tests. The experiment results are as follows:
 ![experiments](figs/image.png)
 
 ## Quickstart
 
 ## Set up environment
-Install dependencies, see `prepare-env.sh` for more details.
+Install dependencies.
 ```
 git clone https://github.com/ByteDance-Seed/WideSearch.git
 cd WideSearch
-sh prepare-env.sh
-source .venv/bin/activate
+python -m pip install -r requirements.txt
 ```
 
 ## Configuration
 1. Implement custom search tools in <a href="src/agent/tools.py">src/agent/tools.py</a>
-2. Configure model parameters in <a href="src/utils/config.py">src/utils/config.py</a>
+2. Configure model parameters in <a href="models.yaml">models.yaml</a>
 
 ## Inference and Evaluation
 Run the following command to perform inference and evaluation:
@@ -79,8 +78,8 @@ Run the following command to perform inference and evaluation:
 python3 scripts/run_infer_and_eval_batching.py \
 --trial_num={your_trial_num} \
 --model_config_name={your_model_config_name} \
---response_root={your_response_root} \
---result_save_root={your_result_save_root} \
+--response-file={your_response_file} \
+--result-file={your_result_file} \
 --stage={infer/eval or both} 
 ``` 
 

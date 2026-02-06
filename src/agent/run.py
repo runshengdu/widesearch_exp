@@ -11,10 +11,12 @@ from typing import Literal
 
 from loguru import logger
 
-from src.agent.agent import DEFAULT_MAX_ERROR_COUNT, DEFAULT_MAX_STEPS, Agent
-from src.agent.memory import (
+from src.agent.agent import (
+    DEFAULT_MAX_ERROR_COUNT,
+    DEFAULT_MAX_STEPS,
     ActionStep,
     ActionStepError,
+    Agent,
     MemoryAgent,
     StepStatus,
     UserInputStep,
@@ -31,7 +33,10 @@ from src.agent.tools import _default_tools
 from src.utils.llm import (
     get_default_system_prompt_insert,
     get_is_claude_thinking,
+    get_token_usage_collector,
     llm_completion,
+    reset_token_usage_collector,
+    set_token_usage_collector,
     transform_model_response,
 )
 
@@ -62,6 +67,7 @@ class Runner:
         # Insert current user input into memory, which will add a new turn for the memory.
         last_turn = memory.insert_user_input(user_input)
 
+        max_step_retry_counter = 0
         max_steps_summary = False
         # Iterate through steps until the agent stops or reaches the maximum number of turns.
         while not max_steps_summary and not last_turn.is_finished():
@@ -81,10 +87,9 @@ class Runner:
             if last_turn.step_number >= max_steps:
                 last_turn.steps.append(
                     UserInputStep(
-                        user_input="[Max Step] The tool has been used too many times. Please stop invoking the tool immediately and answer the user's question."
+                        user_input="[Max Step] Please stop invoking the tool immediately and answer the user's question. If you dare to invoke the tool again, I will destroy you."
                     )
                 )
-                max_steps_summary = True
             # Execute one step
             output_action_step = await cls._step(
                 agent=starting_agent,
@@ -97,6 +102,19 @@ class Runner:
                 llm_error_counter += 1
                 last_llm_error_message = output_action_step.message
                 continue
+
+            if last_turn.step_number >= max_steps:
+                if output_action_step.tool_calls:
+                    if max_step_retry_counter < 2:
+                        max_step_retry_counter += 1
+                    else:
+                        # Drop tool calls and force finish
+                        output_action_step.tool_calls = []
+                        output_action_step.tool_call_results = []
+                        output_action_step.step_status = StepStatus.FINISHED
+                        max_steps_summary = True
+                else:
+                    max_steps_summary = True
 
             # Yield the result of this step
             yield output_action_step
@@ -112,6 +130,8 @@ class Runner:
         llm_error_strategy: Literal["retry", "stop"] = "retry",
     ):
         llm_error_counter = 0
+        max_step_retry_counter = 0
+        max_steps_summary = False
 
         # TODO: merge `run` and `run_until_stop` into one function.
         # Initialize memory if not provided.
@@ -125,7 +145,7 @@ class Runner:
         last_turn = memory.insert_user_input(user_input)
 
         # Iterate through steps until the agent stops or reaches the maximum number of turns.
-        while last_turn.step_number < max_steps and not last_turn.is_finished():
+        while not max_steps_summary and not last_turn.is_finished():
             # Stop if llm error counter reaches the maximum number.
             if llm_error_strategy == "stop" and llm_error_counter > 0:
                 logging.warning("[Runner] stop because `llm_error_strategy=stop`")
@@ -135,6 +155,13 @@ class Runner:
                     f"[Runner] LLM error counter reaches the maximum number: {DEFAULT_MAX_ERROR_COUNT}"
                 )
                 break
+
+            if last_turn.step_number >= max_steps:
+                last_turn.steps.append(
+                    UserInputStep(
+                        user_input="[Max Step] Please stop invoking the tool immediately and answer the user's question. If you dare to invoke the tool again, I will destroy you."
+                    )
+                )
 
             # Execute one step
             _output_action_step = await cls._step(
@@ -147,6 +174,19 @@ class Runner:
             if isinstance(_output_action_step, ActionStepError):
                 llm_error_counter += 1
                 continue
+
+            if last_turn.step_number >= max_steps:
+                if _output_action_step.tool_calls:
+                    if max_step_retry_counter < 2:
+                        max_step_retry_counter += 1
+                    else:
+                        # Drop tool calls and force finish
+                        _output_action_step.tool_calls = []
+                        _output_action_step.tool_call_results = []
+                        _output_action_step.step_status = StepStatus.FINISHED
+                        max_steps_summary = True
+                else:
+                    max_steps_summary = True
 
         if not last_turn.steps:
             return RunResult(stop_reason="error")
@@ -251,6 +291,7 @@ class Runner:
         action_step = ActionStep(
             step_status=step_status,
             content=resp.content,
+            reasoning_details=resp.reasoning_details,
             reasoning_content=resp.reasoning_content,
             signature=resp.signature,
             tool_calls=resp.tool_calls,
@@ -262,20 +303,28 @@ class Runner:
     async def _step(
         cls, *, agent: Agent, memory: MemoryAgent
     ) -> ActionStep | ActionStepError:
+        usage: dict | None = None
         try:
-            model_response = transform_model_response(
-                llm_completion(
-                    messages=memory.to_message(
-                        is_claude_thinking=get_is_claude_thinking(
-                            agent.model_config_name
-                        ),
-                        default_system_prompt_insert=get_default_system_prompt_insert(
-                            agent.model_config_name
-                        ),
+            collector = get_token_usage_collector()
+            pre_len = len(collector) if collector is not None else None
+
+            raw_resp = llm_completion(
+                messages=memory.to_message(
+                    is_claude_thinking=get_is_claude_thinking(agent.model_config_name),
+                    default_system_prompt_insert=get_default_system_prompt_insert(
+                        agent.model_config_name
                     ),
-                    tools=agent.tools_desc,
-                    model_config_name=agent.model_config_name,
-                )
+                ),
+                tools=agent.tools_desc,
+                model_config_name=agent.model_config_name,
+            )
+            if collector is not None and pre_len is not None and len(collector) > pre_len:
+                last = collector[-1]
+                if isinstance(last, dict):
+                    usage = last
+
+            model_response = transform_model_response(
+                raw_resp
             )
         except Exception as e:
             # If there is an exception during LLM completion, return an ActionStepError.
@@ -300,6 +349,8 @@ class Runner:
                 model_response=model_response,
                 tool_call_results=tool_call_results,
             )
+
+        action_step.usage = usage
 
         # To avoid the memory being modified by the caller, we use deepcopy here.
         memory.insert_action_step(deepcopy(action_step))
@@ -340,6 +391,7 @@ async def run_single_query(
     tools: dict = _default_tools,
     tools_desc: list[dict] = [],
     system_prompt: str = get_system_prompt(language="zh"),
+    collect_token_usage: bool = False,
 ):
     agent = Agent(
         name=agent_name,
@@ -352,6 +404,39 @@ async def run_single_query(
 
     memory = MemoryAgent(system_instructions=system_prompt)
     logger.info(f"agent running: {agent_name}, model: {model_config_name}.")
-    await run_turn(agent, memory, query)
+    token_usages: list[dict] | None = None
+    token_var_token = None
+    if collect_token_usage:
+        token_usages = []
+        token_var_token = set_token_usage_collector(token_usages)
+
+    try:
+        await run_turn(agent, memory, query)
+    finally:
+        if token_var_token is not None:
+            reset_token_usage_collector(token_var_token)
     logger.info(f"agent finished: {agent_name}, model: {model_config_name}.")
-    return extract_messages_from_memory(memory)
+
+    messages = extract_messages_from_memory(memory)
+    if not collect_token_usage:
+        return messages
+
+    action_step_count = sum(turn.step_number for turn in memory.turns)
+    prompt_tokens_total = 0
+    completion_tokens_total = 0
+    if token_usages:
+        for u in token_usages:
+            pt = u.get("prompt_tokens")
+            ct = u.get("completion_tokens")
+            if isinstance(pt, int):
+                prompt_tokens_total += pt
+            if isinstance(ct, int):
+                completion_tokens_total += ct
+
+    stats = {
+        "turn_count": len(memory.turns),
+        "action_step_count": action_step_count,
+        "prompt_tokens_total": prompt_tokens_total,
+        "completion_tokens_total": completion_tokens_total,
+    }
+    return messages, stats

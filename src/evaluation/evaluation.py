@@ -7,6 +7,7 @@ This module provides evaluation functions for the WideSearch dataset.
 It includes functions to evaluate single queries and calculate consistency between automatic and human evaluations.
 """
 
+import os
 import traceback
 from copy import deepcopy
 from dataclasses import dataclass
@@ -29,7 +30,7 @@ from src.evaluation.metric_utils import (
 )
 from src.utils.utils import norm_column
 
-pandarallel.initialize(nb_workers=8)
+pandarallel.initialize(nb_workers=os.cpu_count() or 1)
 
 
 @dataclass
@@ -46,18 +47,18 @@ class EvaluationResult:
 
 
 def preprocess_call(content, preprocess_func_name):
-    assert (
-        preprocess_func_name in preprocess_function_registry
-    ), f"preprocess_func_name {preprocess_func_name} not in preprocess_function_registry"
+    assert preprocess_func_name in preprocess_function_registry, (
+        f"preprocess_func_name {preprocess_func_name} not in preprocess_function_registry"
+    )
 
     preprocess_func = preprocess_function_registry[preprocess_func_name]
     return preprocess_func(content)
 
 
 def metric_call(response, target, criterion, metric_func_name):
-    assert (
-        metric_func_name in metric_function_registry
-    ), f"metric_func_name {metric_func_name} not in metric_function_registry"
+    assert metric_func_name in metric_function_registry, (
+        f"metric_func_name {metric_func_name} not in metric_function_registry"
+    )
 
     metric_func = metric_function_registry[metric_func_name]
     if metric_func_name == "llm_judge" or metric_func_name == "number_near":
@@ -82,9 +83,9 @@ def evaluate_single_query(
             msg="response is None",
         )
 
-    assert (
-        query.instance_id == response.instance_id
-    ), f"query.instance_id {query.instance_id} != response.instance_id {response.instance_id}"
+    assert query.instance_id == response.instance_id, (
+        f"query.instance_id {query.instance_id} != response.instance_id {response.instance_id}"
+    )
 
     score = 0.0
     precision_by_row = 0.0
@@ -132,17 +133,25 @@ def evaluate_single_query(
             # preprocess
             for col in required_columns:
                 try:
-                    answer_type = answer_df[col].dtype
-                    response_type = response_df[col].dtype
+                    answer_dtype = answer_df[col].dtype
+                    response_dtype = response_df[col].dtype
                 except Exception:
-                    answer_type = None
-                    response_type = None
-                if (response_type == float and answer_type == int) or (
-                    response_type == int and answer_type == float
+                    answer_dtype = None
+                    response_dtype = None
+
+                if (
+                    response_dtype is not None
+                    and answer_dtype is not None
+                    and (
+                        np.issubdtype(response_dtype, np.floating)
+                        and np.issubdtype(answer_dtype, np.integer)
+                        or np.issubdtype(response_dtype, np.integer)
+                        and np.issubdtype(answer_dtype, np.floating)
+                    )
                 ):
-                    if response_type == int:
+                    if np.issubdtype(response_dtype, np.integer):
                         response_df[col] = response_df[col].astype(float)
-                    elif answer_type == int:
+                    elif np.issubdtype(answer_dtype, np.integer):
                         answer_df[col] = answer_df[col].astype(float)
 
                 answer_df[col] = answer_df[col].astype(str)

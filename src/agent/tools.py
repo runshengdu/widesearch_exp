@@ -1,16 +1,44 @@
-# Copyright (c) 2025 Bytedance Ltd. and/or its affiliates
-# SPDX-License-Identifier: MIT
-
 import asyncio
 import functools
 import json
 import os
+import sys
+import threading
+import time
 import traceback
-from typing import Annotated, Any, Awaitable, Callable, List, Optional
-
+from typing import Any, Awaitable, Callable
+from src.agent import content_summary
+import tiktoken
 import aiohttp
 from loguru import logger
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+from tenacity import retry, stop_after_attempt
+
+
+def _count_tokens(text: str) -> int:
+    enc = tiktoken.get_encoding("cl100k_base")
+    return len(enc.encode(text))
+
+
+def _truncate_tokens(text: str, max_tokens: int) -> str:
+    enc = tiktoken.get_encoding("cl100k_base")
+    return enc.decode(enc.encode(text)[:max_tokens])
+
+
+class RateLimiter:
+    def __init__(self, interval: float):
+        self.interval = interval
+        self._lock = threading.Lock()
+        self._next_time = 0.0
+
+    async def wait(self):
+        with self._lock:
+            now = time.monotonic()
+            wait = max(0.0, self._next_time - now)
+            self._next_time = max(self._next_time, now) + self.interval
+        if wait > 0:
+            await asyncio.sleep(wait)
+_exa_limiter = RateLimiter(interval=0.3)
 
 
 class InternalResponse(BaseModel):
@@ -26,40 +54,6 @@ class InternalResponse(BaseModel):
     extra: dict | None = None
 
 
-class BingSearchRequest(BaseModel):
-    q: str = Field(description="query key")
-    count: int = Field(default=10, ge=1, le=50)
-    offset: int = Field(default=0, ge=0)
-    mkt: str = Field(default="")
-    safeSearch: str = Field(default="Moderate")
-    responseFilter: List[str] = Field(default=[])
-    freshness: str | None = Field(default=None)
-    answerCount: Optional[Annotated[int, Field(ge=1)]] = Field(default=None)
-    promote: List[str] = Field(default=[])
-    textDecorations: bool = Field(default=False)
-    textFormat: str = Field(default="Raw")
-
-
-async def async_bing_search_basic(request_data: BingSearchRequest, api_key=""):
-    url = os.getenv("BING_SEARCH_URL", "https://api.bing.microsoft.com/v7.0/search")
-    params_from_req = request_data.model_dump(
-        mode="json", exclude_none=True, exclude_unset=True
-    )
-    if params_from_req.get("mkt", ""):
-        params_from_req["setLang"] = params_from_req["mkt"]
-
-        if "en" in params_from_req["mkt"]:
-            params_from_req["ensearch"] = 1
-
-    headers = {"Ocp-Apim-Subscription-Key": api_key}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(
-            url, headers=headers, params=params_from_req
-        ) as response:
-            response.raise_for_status()
-            return await response.json()
-
-
 def return_error(error_msg: str, verbose: bool, req: str, context: str):
     warning_msg = f"req={req}, context={context}"
     logger.warning(f"error_msg={error_msg}, {warning_msg}")
@@ -70,8 +64,6 @@ def return_error(error_msg: str, verbose: bool, req: str, context: str):
 
 
 # search tools
-
-
 def timeout_handler(timeout: int = 120):
     def decorator(
         func: Callable[..., Awaitable[InternalResponse]],
@@ -91,63 +83,16 @@ def timeout_handler(timeout: int = 120):
     return decorator
 
 
-async def search_bing(
-    query: str,
-    offset: int = 0,
-    count: int = 10,
-    mkt: str = "zh-CN",
-    verbose: bool = True,
-):
-    api_key = str(os.getenv("BingSearch_APIKEY"))
-
-    try:
-        bing_search_request = BingSearchRequest(
-            q=query,
-            offset=offset,
-            count=count,
-            mkt=mkt,
-        )
-    except Exception:
-        return InternalResponse(
-            error=return_error(
-                error_msg="ERROR: not valid argument search_bing",
-                verbose=verbose,
-                req=query,
-                context=traceback.format_exc(),
-            )
-        )
-
-    try:
-        r = await async_bing_search_basic(bing_search_request, api_key)  # noqa: E501
-        sections = []
-        for num, web_page in enumerate(r.get("webPages", {}).get("value", []), start=1):
-            lines = []
-            lines.append(f"[index] {num}")
-            lines.append(f"[title] {web_page.get('name', '')}")
-            lines.append(f"[datePublished] {web_page.get('datePublished', '')}")
-            lines.append(f"[siteName] {web_page.get('siteName', '')}")
-            lines.append(f"[Url] {web_page.get('url', '')}")
-            lines.append(f"[snippt] {web_page.get('snippet', '')}")
-            sections.append("\n".join(lines))
-        return InternalResponse(data="\n\n".join(sections))
-
-    except Exception:
-        return InternalResponse(
-            error=return_error(
-                "SYSTEM_ERROR",
-                verbose=True,
-                req=query,
-                context=traceback.format_exc(),
-            )
-        )
+def abort_after_retries(retry_state):
+    logger.error(f"Function {retry_state.fn.__name__} failed after {retry_state.attempt_number} retries. Aborting...")
+    logger.error(f"Last exception: {retry_state.outcome.exception()}")
+    sys.exit(1)
 
 
 @timeout_handler(timeout=120)
-async def search_global(
+@retry(stop=stop_after_attempt(3), retry_error_callback=abort_after_retries)
+async def web_search_internationl(
     query: str,
-    count: int = 10,
-    summary_type: str = "short",
-    use_english: bool = False,
 ):
     if not query:
         return InternalResponse(
@@ -158,181 +103,210 @@ async def search_global(
                 context="",
             )
         )
-    if summary_type not in ["short", "long"]:
-        return InternalResponse(
-            error=return_error(
-                error_msg=f'summary_type="{summary_type}" not in ["short", "long"]',
-                verbose=True,
-                req=query,
-                context="",
-            )
-        )
 
-    if count > 200:
-        return InternalResponse(
-            error=return_error(
-                error_msg=f"count={count} not in [0, 200]",
-                verbose=True,
-                req=query,
-                context="",
-            )
-        )
-
-    try:
-        arguments = {
-            "query": query,
-            "count": count,
-            "SummaryType": summary_type,
-        }
-        if use_english:
-            arguments["Filter"] = {"Language": "global"}
-
-        payload = {
-            "name": "GlobalSearch",
-            "arguments": json.dumps(arguments),
-            "traffic_group": os.getenv("TEXTBROWSER_TRAFFIC_GROUP", ""),
-            "traffic_id": os.getenv("TEXTBROWSER_TRAFFIC_ID", ""),
-            "mcp_namespace": "search_tool_api",
-        }
-
-        async def _request_api():
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=120)
-            ) as session:
-                async with session.post(
-                    os.getenv("SEARCH_TOOL_API_URL", ""),
-                    json=payload,
-                ) as response:
-                    response.raise_for_status()
-                    result = await response.json()
-                    return result, response.headers
-
-        result, headers = await _request_api()
-
-        try:
-            assert "result" in result
-            result = json.loads(result["result"])
-            assert "documents" in result, f"documents not in {result}"
-            documents = result["documents"]
-        except Exception:
-            return InternalResponse(
-                error=return_error(
-                    error_msg="search_global invalid result",
-                    verbose=True,
-                    req=query,
-                    context=(
-                        traceback.format_exc()
-                        + "\n"
-                        + f"search_global invalid result={result}, headers={headers}, payload={payload}"
-                    ),
-                )
-            )
-
-        sections = []
-        for num, document in enumerate(documents):
-            if "render" not in document:
-                continue
-            link = document["render"]["link"]
-            snippet = document["content"][0]["text"]
-
-            lines = []
-            lines.append(f"[index] {num}")
-            lines.append(f"[siteName] {link.get('sitename', '')}")
-            lines.append(f"[snippt] {snippet}")
-            sections.append("\n".join(lines))
-
-        # snippets = _parse_response(query, documents)
-
-        return InternalResponse(data="\n\n".join(sections))
-
-    except Exception:
-        return InternalResponse(
-            error=return_error(
-                "SYSTEM_ERROR",
-                verbose=True,
-                req=query,
-                context=traceback.format_exc(),
-            )
-        )
-
-
-# reader tools
-
-
-@timeout_handler(timeout=120)
-async def text_browser_view(url: str, description: str):
-    arguments = {
-        "url": url,
-        "description": description,
-        "is_offline": True,
-        "from_mcp_call": True,
-    }
+    api_key = os.getenv("PARALLEL_API_KEY")
+    await _exa_limiter.wait()
 
     payload = {
-        "name": "TextBrowserView",
-        "arguments": json.dumps(arguments),
-        "traffic_group": os.getenv("TEXTBROWSER_TRAFFIC_GROUP", ""),
-        "traffic_id": os.getenv("TEXTBROWSER_TRAFFIC_ID", ""),
+        "search_queries": [query],
+        "max_results": 5,
+        "excerpts": {"max_chars_per_result": 1000},
     }
+    headers = {
+        "x-api-key": api_key,
+        "Content-Type": "application/json",
+        "parallel-beta": "search-extract-2025-10-10",
+        "accept": "application/json",
+    }
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=120)
+    ) as session:
+        async with session.post(
+            "https://api.parallel.ai/v1beta/search",
+            headers=headers,
+            json=payload,
+        ) as response:
+            response.raise_for_status()
+            result = await response.json()
 
-    try:
+    domain_filter = ["taiwan", "huggingface"]
+    if isinstance(result, dict):
+        items = result.get("results")
+        if isinstance(items, list):
+            filtered_items = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                url = item.get("url", "")
+                if url and any(domain in url.lower() for domain in domain_filter):
+                    continue
+                filtered_items.append(item)
+            result["results"] = filtered_items
 
-        async def _request_api():
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=120)
-            ) as session:
-                async with session.post(
-                    os.getenv("SEARCH_TOOL_API_URL", ""),
-                    json=payload,
-                ) as response:
-                    response.raise_for_status()
-                    result = await response.json()
-                    return result, response.headers
+    data = json.dumps(result, ensure_ascii=False, indent=2)
+    return InternalResponse(
+        data=data,
+        extra={"content_lines": data.splitlines()},
+    )
 
-        result, headers = await _request_api()
-
-        try:
-            assert "result" in result
-            result = json.loads(result["result"])
-            assert "documents" in result
-            documents = result["documents"]
-        except Exception:
-            return InternalResponse(
-                error=return_error(
-                    error_msg="text_browser_view invalid result",
-                    verbose=True,
-                    req=url,
-                    context=(
-                        traceback.format_exc()
-                        + "\n"
-                        + "text_browser_view invalid "
-                        + f"result={result}, headers={headers}, payload={payload}"
-                    ),
-                )
-            )
-
-        chunks = []
-        if documents is None:
-            return InternalResponse(data="Read url failed. No documents found.")
-        for doc in documents:
-            for content in doc["content"]:
-                if content["type"] == "text":
-                    chunks.append(content["text"])
-        content = "\n".join(chunks)
-
-        return InternalResponse(data=content)
-    except Exception:
+@timeout_handler(timeout=120)
+@retry(stop=stop_after_attempt(3), retry_error_callback=abort_after_retries)
+async def web_search_chinese(
+    query: str,
+):
+    if not query:
         return InternalResponse(
             error=return_error(
-                "SYSTEM_ERROR",
+                error_msg="error: query is empty",
                 verbose=True,
-                req=url,
-                context=traceback.format_exc(),
+                req=query,
+                context="",
             )
         )
+
+    api_key = os.getenv("GLM_API_KEY")
+    await _exa_limiter.wait()
+
+    payload = {
+        "search_query": query,
+        "search_engine": "search_pro",
+        "count": 5,
+        "content_size": "medium"
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "accept": "application/json",
+    }
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=120)
+    ) as session:
+        async with session.post(
+            "https://open.bigmodel.cn/api/paas/v4/web_search",
+            headers=headers,
+            json=payload,
+        ) as response:
+            response.raise_for_status()
+            result = await response.json()
+
+    domain_filter = ["taiwan", "huggingface"]
+    if isinstance(result, dict):
+        items = result.get("search_result")
+        if isinstance(items, list):
+            filtered_items = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                url = item.get("link", "")
+                if url and any(domain in url.lower() for domain in domain_filter):
+                    continue
+                filtered_items.append(item)
+            result["search_result"] = filtered_items
+
+    data = json.dumps(result, ensure_ascii=False, indent=2)
+    return InternalResponse(
+        data=data,
+        extra={"content_lines": data.splitlines()},
+    )
+
+@timeout_handler(timeout=120)
+@retry(stop=stop_after_attempt(3), retry_error_callback=abort_after_retries)
+async def get_content(url: str):
+    if not url:
+        return InternalResponse(error="error: url is empty")
+
+    api_key = os.getenv("EXA_API_KEY")
+    await _exa_limiter.wait()
+
+    payload = {
+        "urls": [url],
+        "extras": {
+            "links": 0
+        },
+        "subpages": 0,
+        "summary": True,
+        "text": {
+            "verbosity": "standard"
+        }
+    }
+    headers = {
+        "x-api-key": api_key,
+        "Content-Type": "application/json",
+        "accept": "application/json",
+    }
+
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=120)
+    ) as session:
+        async with session.post(
+            "https://api.exa.ai/contents",
+            headers=headers,
+            json=payload,
+        ) as response:
+            response.raise_for_status()
+            result = await response.json()
+
+    if not isinstance(result, dict):
+        return InternalResponse(error="Invalid response from Exa contents API")
+
+    statuses = result.get("statuses") or []
+    for status in statuses:
+        if not isinstance(status, dict):
+            continue
+        if status.get("id") != url:
+            continue
+        if status.get("status") == "error":
+            err = status.get("error") or {}
+            tag = err.get("tag", "")
+            http_code = err.get("httpStatusCode", "")
+            return InternalResponse(error=f"Exa crawl error: {tag} ({http_code})")
+
+    results = result.get("results") or []
+    if not results or not isinstance(results, list) or not isinstance(results[0], dict):
+        return InternalResponse(error="No content returned from Exa contents API")
+
+    max_text_tokens = 4000
+    for item in results:
+        text = item.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        token_count = _count_tokens(text)
+        if token_count <= max_text_tokens:
+            continue
+
+        try:
+            summary = await asyncio.to_thread(content_summary.summarize_text, text)
+            item["text"] = summary
+        except Exception:
+            item["text"] = _truncate_tokens(text, max_text_tokens)
+            logger.warning(
+                f"content summary failed for url={url}, token_count={token_count}: {traceback.format_exc()}"
+            )
+
+    data = json.dumps(result, ensure_ascii=False, indent=2)
+    return InternalResponse(
+        data=data,
+        extra={"content_lines": data.splitlines()},
+    )
 
 
 _default_tools = {
-    "search_global": search_global,
-    "text_browser_view": text_browser_view,
+    "web_search_internationl": web_search_internationl,
+    "web_search_chinese": web_search_chinese,
+    "get_content": get_content,
 }
+
+
+#test get_content
+async def test_get_content():
+    """Test get_content function and print results to terminal."""
+    test_url = "https://zh.wikipedia.org/wiki/%E9%9A%8B%E6%9C%9D"
+    result = await get_content(test_url)
+    print(f"Testing get_content with URL: {test_url}")
+    print("=" * 80)
+    print(result.data)
+
+if __name__ == "__main__":
+    logger.remove()
+    logger.add(sys.stderr, level="INFO")
+    asyncio.run(test_get_content())

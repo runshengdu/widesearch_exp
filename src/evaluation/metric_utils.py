@@ -69,13 +69,31 @@ def url_match(response: str, target: str):
         r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"
     )
 
-    response_urls = url_pattern.findall(response)
-    target_urls = url_pattern.findall(target)
-    response_urls = [urlparse(url).netloc for url in response_urls]
-    target_urls = [urlparse(url).netloc for url in target_urls]
+    def safe_netloc(url: str) -> str:
+        try:
+            return urlparse(url).netloc
+        except ValueError:
+            scheme_pos = url.find("://")
+            rest = url[scheme_pos + 3 :] if scheme_pos != -1 else url
+            hostport = rest.split("/", 1)[0]
+            if "@" in hostport:
+                hostport = hostport.split("@", 1)[1]
+            if hostport.startswith("[") and "]" in hostport:
+                return hostport[1 : hostport.find("]")]
+            return hostport
 
-    if set(response_urls) == set(target_urls):
+    response_urls_raw = url_pattern.findall(response)
+    target_urls_raw = url_pattern.findall(target)
+    response_hosts = [safe_netloc(url) for url in response_urls_raw]
+    target_hosts = [safe_netloc(url) for url in target_urls_raw]
+    response_hosts = [h for h in response_hosts if h]
+    target_hosts = [h for h in target_hosts if h]
+
+    if response_hosts and target_hosts and set(response_hosts) == set(target_hosts):
         return 1.0, f"url match, response: {response}, target: {target}"
+    if not response_hosts and not target_hosts:
+        if set(response_urls_raw) == set(target_urls_raw):
+            return 1.0, f"url match, response: {response}, target: {target}"
     return 0.0, f"url not match, response: {response}, target: {target}"
 
 

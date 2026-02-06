@@ -28,8 +28,6 @@ cffi==1.17.1
     # via cryptography
 cryptography==45.0.5
     # via volcengine-python-sdk
-dataclasses==0.8
-    # via widesearch (pyproject.toml)
 dateparser==1.2.2
     # via widesearch (pyproject.toml)
 dill==0.4.0
@@ -119,6 +117,7 @@ soupsieve==2.7
     # via beautifulsoup4
 threadpoolctl==3.6.0
     # via scikit-learn
+tiktoken==0.7.0
 tqdm==4.67.1
     # via openai
 typing-extensions==4.14.1
