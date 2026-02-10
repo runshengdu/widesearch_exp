@@ -38,7 +38,9 @@ class RateLimiter:
             self._next_time = max(self._next_time, now) + self.interval
         if wait > 0:
             await asyncio.sleep(wait)
-_exa_limiter = RateLimiter(interval=0.3)
+_parallel_search_limiter = RateLimiter(interval=0.15)
+_exa_contents_limiter = RateLimiter(interval=0.025)
+_glm_web_search_concurrency = asyncio.Semaphore(40)
 
 
 class InternalResponse(BaseModel):
@@ -105,7 +107,7 @@ async def web_search_internationl(
         )
 
     api_key = os.getenv("PARALLEL_API_KEY")
-    await _exa_limiter.wait()
+    await _parallel_search_limiter.wait()
 
     payload = {
         "search_queries": [query],
@@ -165,11 +167,10 @@ async def web_search_chinese(
         )
 
     api_key = os.getenv("GLM_API_KEY")
-    await _exa_limiter.wait()
 
     payload = {
         "search_query": query,
-        "search_engine": "search_pro",
+        "search_engine": "search_std",
         "count": 5,
         "content_size": "medium"
     }
@@ -178,16 +179,17 @@ async def web_search_chinese(
         "Content-Type": "application/json",
         "accept": "application/json",
     }
-    async with aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=120)
-    ) as session:
-        async with session.post(
-            "https://open.bigmodel.cn/api/paas/v4/web_search",
-            headers=headers,
-            json=payload,
-        ) as response:
-            response.raise_for_status()
-            result = await response.json()
+    async with _glm_web_search_concurrency:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=120)
+        ) as session:
+            async with session.post(
+                "https://open.bigmodel.cn/api/paas/v4/web_search",
+                headers=headers,
+                json=payload,
+            ) as response:
+                response.raise_for_status()
+                result = await response.json()
 
     domain_filter = ["taiwan", "huggingface"]
     if isinstance(result, dict):
@@ -216,7 +218,7 @@ async def get_content(url: str):
         return InternalResponse(error="error: url is empty")
 
     api_key = os.getenv("EXA_API_KEY")
-    await _exa_limiter.wait()
+    await _exa_contents_limiter.wait()
 
     payload = {
         "urls": [url],

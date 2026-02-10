@@ -16,9 +16,6 @@ from pathlib import Path
 import numpy as np
 from loguru import logger
 
-# Add project root to sys.path
-sys.path.append(str(Path(__file__).resolve().parent.parent))
-
 from src.agent.prompt import (
     get_system_prompt,
     get_tools_api_description,
@@ -77,35 +74,42 @@ class SingleTask:
 
         messages = _sanitize_messages_for_save(messages)
 
-        assistant_message_count = 0
+        # Prepare assistant_message_count object
+        assistant_count = 0
+        final_usage = None
         tool_call_counts = {
             "web_search_chinese": 0,
             "web_search_internationl": 0,
             "get_content": 0,
         }
+
         for m in messages:
             if not isinstance(m, dict):
                 continue
-            if m.get("role") != "assistant":
-                continue
-            assistant_message_count += 1
-            content = m.get("content")
-            if not isinstance(content, dict):
-                continue
-            tool_calls = content.get("tool_calls")
-            if not isinstance(tool_calls, list):
-                continue
-            for tc in tool_calls:
-                if not isinstance(tc, dict):
-                    continue
-                name = tc.get("tool_name")
-                if name in tool_call_counts:
-                    tool_call_counts[name] += 1
+            if m.get("role") == "assistant":
+                assistant_count += 1
+                if m.get("usage"):
+                    final_usage = m.get("usage")
+
+                content = m.get("content")
+                if isinstance(content, dict):
+                    tool_calls = content.get("tool_calls")
+                    if isinstance(tool_calls, list):
+                        for tc in tool_calls:
+                            if isinstance(tc, dict):
+                                name = tc.get("tool_name")
+                                if name in tool_call_counts:
+                                    tool_call_counts[name] += 1
+
+        assistant_message_count_obj = {
+            "count": assistant_count,
+            "final_token": final_usage,
+        }
 
         wide_search_response = WideSearchResponse(
             instance_id=self.query.instance_id,
             response=response,
-            assistant_message_count=assistant_message_count,
+            assistant_message_count=assistant_message_count_obj,
             tool_call_counts=tool_call_counts,
             messages=messages,
             trial_idx=self.trial_idx,
@@ -138,19 +142,51 @@ def _append_jsonl(path: str, obj: dict) -> None:
         f.write(json.dumps(obj, ensure_ascii=False, indent=2) + "\n")
 
 
+def _write_response_file_metadata_if_needed(
+    response_file: str, model_config_name: str
+) -> None:
+    if os.path.exists(response_file) and os.path.getsize(response_file) > 0:
+        return
+    _append_jsonl(
+        response_file,
+        {
+            "model_config_name": model_config_name,
+            "model_config": get_model_config_no_key(model_config_name),
+        },
+    )
+
+
 def _sanitize_messages_for_save(messages: list[dict]) -> list[dict]:
     out: list[dict] = []
     for m in messages:
         if not isinstance(m, dict):
             out.append(m)
             continue
+
+        # Create a shallow copy to modify
+        m = dict(m)
+        # Remove model field from top level
+        m.pop("model", None)
+
         if m.get("role") != "assistant":
             out.append(m)
             continue
+
         content = m.get("content")
         if not isinstance(content, dict):
             out.append(m)
             continue
+
+        # Remove model field from content if exists
+        content.pop("model", None)
+
+        # Move usage to top level if it exists in content
+        if "usage" in content:
+            usage = content.pop("usage")
+            if isinstance(usage, dict):
+                # Remove model field from usage if exists
+                usage.pop("model", None)
+            m["usage"] = usage
 
         tcrs = content.get("tool_call_results")
         if not isinstance(tcrs, list):
@@ -164,6 +200,7 @@ def _sanitize_messages_for_save(messages: list[dict]) -> list[dict]:
                 continue
             tcr = dict(tcr)
             tcr.pop("extra", None)
+            tcr.pop("model", None)  # Be thorough
 
             tcr_content = tcr.get("content")
             if isinstance(tcr_content, str):
@@ -175,9 +212,8 @@ def _sanitize_messages_for_save(messages: list[dict]) -> list[dict]:
 
         new_content = dict(content)
         new_content["tool_call_results"] = new_tcrs
-        new_m = dict(m)
-        new_m["content"] = new_content
-        out.append(new_m)
+        m["content"] = new_content
+        out.append(m)
 
     return out
 
@@ -188,7 +224,7 @@ def _is_error_response(response: WideSearchResponse) -> bool:
     error_patterns = [
         "[Runner] Exception during LLM completion:",
         "Too many errors have occurred.",
-        "[Max Step] The tool has been used too many times."
+        "[Max Step] The tool has been used too many times.",
     ]
     for pattern in error_patterns:
         if pattern in resp:
@@ -202,49 +238,77 @@ def _load_responses_map(
     responses_map: dict[tuple[str, int], WideSearchResponse] = {}
     if not os.path.exists(response_file):
         return responses_map
-    
-    with open(response_file, "r", encoding="utf-8") as f:
-        # Try reading line by line first (standard JSONL)
-        lines = f.readlines()
-        
-    # Attempt to parse line by line
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
+
+    decoder = json.JSONDecoder()
+    allowed_fields = {f.name for f in dataclasses.fields(WideSearchResponse)}
+    parsed_obj_count = 0
+    skipped_obj_count = 0
+    error_obj_count = 0
+
+    def _add_obj(obj: dict) -> None:
+        nonlocal parsed_obj_count, skipped_obj_count, error_obj_count
+        if not isinstance(obj, dict):
+            skipped_obj_count += 1
+            return
+        if "instance_id" not in obj or "response" not in obj:
+            skipped_obj_count += 1
+            return
         try:
-            item = json.loads(line)
-            # Skip model_config metadata line if present
-            if "model_config" in item:
+            resp = WideSearchResponse(**obj)
+        except TypeError:
+            obj = {k: v for k, v in obj.items() if k in allowed_fields}
+            try:
+                resp = WideSearchResponse(**obj)
+            except Exception:
+                error_obj_count += 1
+                return
+        except Exception:
+            error_obj_count += 1
+            return
+
+        try:
+            trial_idx = int(resp.trial_idx) if resp.trial_idx is not None else 1
+        except Exception:
+            trial_idx = 1
+        if trial_idx <= 0:
+            trial_idx = 1
+        responses_map[(resp.instance_id, trial_idx)] = resp
+        parsed_obj_count += 1
+
+    buf = ""
+    with open(response_file, "r", encoding="utf-8") as f:
+        for line in f:
+            if not buf and not line.strip():
                 continue
-            resp = WideSearchResponse(**item)
-            trial_idx = int(resp.trial_idx or 0)
-            responses_map[(resp.instance_id, trial_idx)] = resp
-        except (json.JSONDecodeError, TypeError):
-            # If line-by-line fails for a specific line, try more robust parsing
-            # This handles the case where multiple pretty-printed JSON objects are concatenated
-            decoder = json.JSONDecoder()
-            content = line
-            idx = 0
-            while idx < len(content):
-                # Skip whitespace
-                while idx < len(content) and content[idx].isspace():
-                    idx += 1
-                if idx >= len(content):
+            buf += line
+
+            while True:
+                s = buf.lstrip()
+                if not s:
+                    buf = ""
                     break
-                    
+                leading_ws = len(buf) - len(s)
                 try:
-                    obj, end_idx = decoder.raw_decode(content, idx)
-                    if isinstance(obj, dict) and "model_config" in obj:
-                        idx = end_idx
-                        continue
-                    resp = WideSearchResponse(**obj)
-                    trial_idx = int(resp.trial_idx or 0)
-                    responses_map[(resp.instance_id, trial_idx)] = resp
-                    idx = end_idx
-                except (json.JSONDecodeError, TypeError):
+                    obj, end_idx = decoder.raw_decode(buf, leading_ws)
+                except json.JSONDecodeError:
                     break
-                
+                except Exception:
+                    error_obj_count += 1
+                    break
+                _add_obj(obj)
+                buf = buf[end_idx:]
+
+    tail = buf.strip()
+    if tail:
+        try:
+            obj = json.loads(tail)
+            _add_obj(obj)
+        except Exception:
+            error_obj_count += 1
+
+    logger.info(
+        f"loaded responses from {response_file}: parsed={parsed_obj_count}, skipped={skipped_obj_count}, errors={error_obj_count}, map_size={len(responses_map)}"
+    )
     return responses_map
 
 
@@ -275,9 +339,11 @@ def _load_scored_keys(result_file: str) -> set[tuple[str, int]]:
                 continue
             trial_idx_raw = row.get("trial_idx")
             try:
-                trial_idx = int(float(trial_idx_raw)) if trial_idx_raw else 0
+                trial_idx = int(float(trial_idx_raw)) if trial_idx_raw else 1
             except Exception:
-                trial_idx = 0
+                trial_idx = 1
+            if trial_idx <= 0:
+                trial_idx = 1
             scored.add((instance_id, trial_idx))
     return scored
 
@@ -323,11 +389,11 @@ def _calc_summary_from_csv(result_file: str, trial_num: int) -> dict:
             values = trial_metrics[m]
             if not values or len(values) < trial_num:
                 # If not enough trials, skip this instance for this metric
-                logger.info(f"Skipping {m} for instance {iid}, not enough trials")
-                raise ValueError(
-                    f"Not enough trials for metric {m} on instance {iid}. "
+                logger.warning(
+                    f"Skipping {m} for instance {iid}, not enough trials. "
                     f"Expected {trial_num}, got {len(values)}."
                 )
+                continue
             avg_n = float(np.mean(values))
             max_n = float(np.max(values))
             min_n = float(np.min(values))
@@ -359,8 +425,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--stage",
         type=str,
-        default="both",
-        choices=["eval", "infer", "both"],
+        default="infer",
+        choices=["eval", "infer"],
         help="stage to run",
     )
 
@@ -373,7 +439,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--evaluator",
         type=str,
-        default="google/gemini-3-flash-preview",
+        default="deepseek-reasoner",
         help="eval model config name",
     )
     parser.add_argument("--trial_num", type=int, default=1, help="trial num to run")
@@ -389,8 +455,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--language",
         type=str,
-        default="en",
-        choices=["zh", "en"],
+        default="",
+        choices=["", "zh", "en"],
         help="filter tasks by language",
     )
 
@@ -408,33 +474,72 @@ if __name__ == "__main__":
         response_file = str(
             Path("data") / model_config_name / "response" / f"{timestamp}.jsonl"
         )
+
+    inferred_model_name_from_response: str | None = None
+    if response_file_provided:
+        try:
+            rp = Path(response_file)
+            parts = list(rp.parts)
+            if "data" in parts:
+                data_idx = parts.index("data")
+                if data_idx + 1 < len(parts):
+                    inferred_model_name_from_response = parts[data_idx + 1]
+        except Exception:
+            inferred_model_name_from_response = None
+
     result_file = args.result_file
     if not result_file:
+        result_model_name = model_config_name
+        if (
+            response_file_provided
+            and args.stage == "eval"
+            and inferred_model_name_from_response
+        ):
+            result_model_name = inferred_model_name_from_response
         result_file = str(
-            Path("data") / model_config_name / "eval" / f"{timestamp}.csv"
+            Path("data") / result_model_name / "eval" / f"{timestamp}.csv"
         )
 
     _ensure_parent_dir(response_file)
     _ensure_parent_dir(result_file)
 
-    print(f"DEBUG: response_file path is: {os.path.abspath(response_file)}")
+    logger.debug(f"DEBUG: response_file path is: {os.path.abspath(response_file)}")
     summary_result_path = str(Path(result_file).parent / f"{timestamp}_summary.json")
+
+    if args.stage == "infer":
+        _write_response_file_metadata_if_needed(response_file, model_config_name)
 
     data_loader = WideSearchDataLoaderHF()
 
-    instance_id_list = data_loader.get_instance_id_list()
+    responses_map_for_eval: dict[tuple[str, int], WideSearchResponse] | None = None
+    eval_keys_from_response: list[tuple[str, int]] | None = None
+    if args.stage == "eval" and response_file_provided:
+        responses_map_for_eval = _load_responses_map(response_file)
+        eval_keys_from_response = sorted(responses_map_for_eval.keys())
+        instance_id_list = sorted({iid for (iid, _) in eval_keys_from_response})
+        logger.info(
+            f"eval-only with response-file: restrict tasks to response keys: unique_instances={len(instance_id_list)}, keys={len(eval_keys_from_response)}"
+        )
+    else:
+        instance_id_list = data_loader.get_instance_id_list()
 
     tasks = []
 
     tools = _default_tools
 
-    for instance_id in instance_id_list:
-        query = data_loader.load_query_by_instance_id(instance_id)
+    if eval_keys_from_response is not None:
+        for instance_id, trial_idx in eval_keys_from_response:
+            try:
+                query = data_loader.load_query_by_instance_id(instance_id)
+            except Exception:
+                logger.warning(
+                    f"skip response instance_id not found in dataset: {instance_id}"
+                )
+                continue
 
-        if args.language and query.language != args.language:
-            continue
+            if args.language and query.language != args.language:
+                continue
 
-        for trial_idx in range(trial_num):
             tasks.append(
                 SingleTask(
                     query=deepcopy(query),
@@ -444,12 +549,29 @@ if __name__ == "__main__":
                     eval_model_config_name=args.evaluator,
                 )
             )
+    else:
+        for instance_id in instance_id_list:
+            query = data_loader.load_query_by_instance_id(instance_id)
+
+            if args.language and query.language != args.language:
+                continue
+
+            for trial_idx in range(1, trial_num + 1):
+                tasks.append(
+                    SingleTask(
+                        query=deepcopy(query),
+                        trial_idx=trial_idx,
+                        model_config_name=model_config_name,
+                        tools=tools,
+                        eval_model_config_name=args.evaluator,
+                    )
+                )
 
     if args.num_tasks is not None and args.num_tasks > 0:
         tasks = tasks[: args.num_tasks]
 
     logger.info(f"total task num: {len(tasks)}")
-    if args.stage in ["infer", "both"]:
+    if args.stage == "infer":
         infer_tasks = tasks
         if response_file_provided and os.path.exists(response_file):
             responses_map = _load_responses_map(response_file)
@@ -490,10 +612,13 @@ if __name__ == "__main__":
 
                         instance_id = item.get("instance_id")
                         trial_idx = item.get("trial_idx")
-                        
+
                         # Check if response is empty
                         resp_content = item.get("response")
-                        if not resp_content or str(resp_content).strip() in ["", "NULL"]:
+                        if not resp_content or str(resp_content).strip() in [
+                            "",
+                            "NULL",
+                        ]:
                             logger.warning(
                                 f"infer skipped writing, response is empty, instance_id: {instance_id}, trial_idx: {trial_idx}"
                             )
@@ -516,7 +641,7 @@ if __name__ == "__main__":
 
                         with write_lock:
                             write_failed_count_ref[0] += 1
-                        
+
                         # Add specific failure reason if available
                         reason = "Unknown error"
                         if "item" in locals() and isinstance(item, dict):
@@ -525,7 +650,7 @@ if __name__ == "__main__":
                                 reason = "Empty response"
                             else:
                                 reason = "File append error or JSON parsing error"
-                        
+
                         logger.error(
                             f"infer write failed (Reason: {reason}), instance_id: {instance_id}, trial_idx: {trial_idx}, error: {err}"
                         )
@@ -563,9 +688,7 @@ if __name__ == "__main__":
             interrupted = False
             try:
                 while future_to_task:
-                    done, _ = wait(
-                        future_to_task.keys(), return_when=FIRST_COMPLETED
-                    )
+                    done, _ = wait(future_to_task.keys(), return_when=FIRST_COMPLETED)
                     for future in done:
                         task = future_to_task.pop(future)
                         try:
@@ -578,7 +701,7 @@ if __name__ == "__main__":
                                 continue
 
                             obj = dataclasses.asdict(resp)
-                            print(
+                            logger.debug(
                                 f"DEBUG: enqueue response for {resp.instance_id} (trial_idx={resp.trial_idx}) to {response_file}"
                             )
                             write_queue.put(obj)
@@ -589,7 +712,7 @@ if __name__ == "__main__":
                             failed_count += 1
                             inflight_slots.release()
                             err = traceback.format_exc()
-                            print(
+                            logger.debug(
                                 f"DEBUG: infer failed (NOT written) for {task.query.instance_id} (trial_idx={task.trial_idx}): {err}"
                             )
                             logger.error(
@@ -628,7 +751,7 @@ if __name__ == "__main__":
                 f"infer done, enqueued: {enqueued_count}, infer_failed_not_enqueued: {failed_count}, written: {_written_count}, write_failed: {_write_failed_count}"
             )
 
-    if args.stage in ["eval", "both"]:
+    if args.stage == "eval":
         eval_tasks = tasks
         if result_file_provided and os.path.exists(result_file):
             scored_keys = _load_scored_keys(result_file)
@@ -642,7 +765,14 @@ if __name__ == "__main__":
             )
 
         if eval_tasks:
-            responses_map = _load_responses_map(response_file)
+            responses_map = responses_map_for_eval or _load_responses_map(response_file)
+            hit_count = 0
+            for task in eval_tasks:
+                if (task.query.instance_id, task.trial_idx) in responses_map:
+                    hit_count += 1
+            logger.info(
+                f"eval response hits: {hit_count}/{len(eval_tasks)} (miss={len(eval_tasks) - hit_count})"
+            )
             fieldnames = [
                 "instance_id",
                 "trial_idx",
@@ -706,13 +836,10 @@ if __name__ == "__main__":
                             )
 
         summary = _calc_summary_from_csv(result_file=result_file, trial_num=trial_num)
-        
+
         # Add evaluator config to summary
         evaluator_config = get_model_config_no_key(args.evaluator, is_evaluator=True)
-        final_summary = {
-            "evaluator_config": evaluator_config,
-            "summary": summary
-        }
-        
+        final_summary = {"evaluator_config": evaluator_config, "summary": summary}
+
         with open(summary_result_path, "w", encoding="utf-8") as f:
             json.dump(final_summary, f, indent=2, ensure_ascii=False)

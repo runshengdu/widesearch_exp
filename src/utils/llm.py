@@ -249,14 +249,21 @@ def openai_complete(
     if collector is not None:
         usage = getattr(completion, "usage", None)
         if usage is not None:
-            collector.append(
-                {
-                    "model": model_name,
-                    "prompt_tokens": getattr(usage, "prompt_tokens", None),
-                    "completion_tokens": getattr(usage, "completion_tokens", None),
-                    "total_tokens": getattr(usage, "total_tokens", None),
-                }
-            )
+            usage_dict: dict[str, Any]
+            if isinstance(usage, dict):
+                usage_dict = copy.deepcopy(usage)
+            elif hasattr(usage, "model_dump"):
+                usage_dict = usage.model_dump()  # type: ignore[attr-defined]
+            elif hasattr(usage, "dict"):
+                usage_dict = usage.dict()  # type: ignore[attr-defined]
+            else:
+                try:
+                    usage_dict = dict(usage)  # type: ignore[arg-type]
+                except Exception:
+                    usage_dict = getattr(usage, "__dict__", {}) or {"usage": str(usage)}
+
+            usage_dict["model"] = model_name
+            collector.append(usage_dict)
 
     return completion.choices[0].message
 

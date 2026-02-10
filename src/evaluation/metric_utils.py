@@ -355,7 +355,7 @@ def llm_judge(
     #     return 0.0, result.content
 
     # return score, result.content
-    return None, None
+    return 0.0, "llm_judge not implemented"
 
 
 @register_metric_function

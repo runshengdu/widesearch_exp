@@ -145,7 +145,9 @@ class WideSearchResponse:
     instance_id: str
     response: str
 
-    assistant_message_count: Optional[int] = None
+    model_config: Optional[dict[str, Any]] = None
+
+    assistant_message_count: Optional[dict[str, Any]] = None
     tool_call_counts: Optional[dict[str, int]] = None
 
     messages: Optional[list[dict]] = None
@@ -154,8 +156,6 @@ class WideSearchResponse:
     turn_count: Optional[int] = None
     action_step_count: Optional[int] = None
     llm_calls: Optional[list[dict[str, Any]]] = None
-    prompt_tokens_total: Optional[int] = None
-    completion_tokens_total: Optional[int] = None
 
     def extract_dataframe(self) -> pd.DataFrame | None:
         response_df = None
@@ -201,6 +201,12 @@ class WideSearchResponseLoader:
         )
         new_response_list = []
         for item in response_list:
+            instance_id = item.get("instance_id")
+            response = item.get("response")
+            if not isinstance(instance_id, str) or not instance_id.strip():
+                continue
+            if response is None or (isinstance(response, float) and pd.isna(response)):
+                continue
             new_response_list.append(WideSearchResponse(**item))
         return new_response_list
 

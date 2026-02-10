@@ -1,5 +1,4 @@
 import sys
-from typing import Any
 from pathlib import Path
 from openai import OpenAI
 import os

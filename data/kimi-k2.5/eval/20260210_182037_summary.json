@@ -1,0 +1,50 @@
+{
+  "evaluator_config": {
+    "name": "google/gemini-3-flash-preview",
+    "temperature": 1.0,
+    "base_url": "https://openrouter.ai/api/v1",
+    "extra_body": {
+      "reasoning": {
+        "effort": "minimal"
+      }
+    },
+    "max_tokens": 60000
+  },
+  "summary": {
+    "score": {
+      "avg_n": 0.0,
+      "max_n": 0.0,
+      "min_n": 0.0
+    },
+    "precision_by_row": {
+      "avg_n": 0.8,
+      "max_n": 0.8,
+      "min_n": 0.8
+    },
+    "recall_by_row": {
+      "avg_n": 0.8,
+      "max_n": 0.8,
+      "min_n": 0.8
+    },
+    "f1_by_row": {
+      "avg_n": 0.8000000000000002,
+      "max_n": 0.8000000000000002,
+      "min_n": 0.8000000000000002
+    },
+    "precision_by_item": {
+      "avg_n": 0.9166666666666666,
+      "max_n": 0.9166666666666666,
+      "min_n": 0.9166666666666666
+    },
+    "recall_by_item": {
+      "avg_n": 0.9166666666666666,
+      "max_n": 0.9166666666666666,
+      "min_n": 0.9166666666666666
+    },
+    "f1_by_item": {
+      "avg_n": 0.9166666666666666,
+      "max_n": 0.9166666666666666,
+      "min_n": 0.9166666666666666
+    }
+  }
+}

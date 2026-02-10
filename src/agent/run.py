@@ -389,10 +389,12 @@ async def run_single_query(
     agent_name: str = "",
     model_config_name: str = "",
     tools: dict = _default_tools,
-    tools_desc: list[dict] = [],
+    tools_desc: list[dict] | None = None,
     system_prompt: str = get_system_prompt(language="zh"),
     collect_token_usage: bool = False,
 ):
+    if tools_desc is None:
+        tools_desc = []
     agent = Agent(
         name=agent_name,
         tools=tools,
@@ -422,21 +424,9 @@ async def run_single_query(
         return messages
 
     action_step_count = sum(turn.step_number for turn in memory.turns)
-    prompt_tokens_total = 0
-    completion_tokens_total = 0
-    if token_usages:
-        for u in token_usages:
-            pt = u.get("prompt_tokens")
-            ct = u.get("completion_tokens")
-            if isinstance(pt, int):
-                prompt_tokens_total += pt
-            if isinstance(ct, int):
-                completion_tokens_total += ct
-
     stats = {
         "turn_count": len(memory.turns),
         "action_step_count": action_step_count,
-        "prompt_tokens_total": prompt_tokens_total,
-        "completion_tokens_total": completion_tokens_total,
+        "token_usages": token_usages or [],
     }
     return messages, stats

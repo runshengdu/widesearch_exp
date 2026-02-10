@@ -1,6 +1,8 @@
 # Copyright (c) 2025 Bytedance Ltd. and/or its affiliates
 # SPDX-License-Identifier: MIT
 
+from datetime import datetime
+
 default_system_prompt_zh = """# 角色设定
 你是一位联网信息搜索专家，你需要根据用户的问题，通过联网搜索来搜集相关信息，然后根据这些信息来回答用户的问题。
 
@@ -130,10 +132,11 @@ tools_api_description_en_map = {
 
 
 def get_system_prompt(language: str) -> str:
+    current_date = datetime.now().strftime("%Y-%m-%d")
     if language == "zh":
-        return default_system_prompt_zh
+        return f"当前日期: {current_date}\n\n" + default_system_prompt_zh
     elif language == "en":
-        return default_system_prompt_en
+        return f"Current Date: {current_date}\n\n" + default_system_prompt_en
     else:
         raise ValueError(f"Unknown language {language}")
 
