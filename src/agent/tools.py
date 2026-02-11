@@ -267,7 +267,7 @@ async def get_content(url: str):
     if not results or not isinstance(results, list) or not isinstance(results[0], dict):
         return InternalResponse(error="No content returned from Exa contents API")
 
-    max_text_tokens = 4000
+    max_text_tokens = 5000
     for item in results:
         text = item.get("text")
         if not isinstance(text, str) or not text.strip():

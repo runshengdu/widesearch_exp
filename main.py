@@ -419,7 +419,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model-id",
         type=str,
-        default="openai/gpt-5.2",
+        default="kimi-k2.5",
         help="model config name",
     )
     parser.add_argument(
@@ -439,7 +439,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--evaluator",
         type=str,
-        default="deepseek-reasoner",
+        default="kimi-k2.5",
         help="eval model config name",
     )
     parser.add_argument("--trial_num", type=int, default=1, help="trial num to run")
