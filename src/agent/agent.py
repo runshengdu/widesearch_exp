@@ -1,6 +1,7 @@
 # Copyright (c) 2025 Bytedance Ltd. and/or its affiliates
 # SPDX-License-Identifier: MIT
 
+import json
 from dataclasses import dataclass, field
 from enum import Enum
 from types import CoroutineType
@@ -39,9 +40,95 @@ class Agent:
         return self.tools.get(tool_name)
 
 
+def _reduce_tool_message_content(content: str) -> str:
+    """Remove 'text' field from results[] in tool message content to reduce tokens.
+
+    This is applied to get_content tool results where 'text' contains the full webpage.
+    The 'summary' field is preserved for context.
+    """
+    try:
+        data = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return content
+
+    if not isinstance(data, dict):
+        return content
+
+    results = data.get("results")
+    if not isinstance(results, list):
+        return content
+
+    modified = False
+    for item in results:
+        if isinstance(item, dict) and "text" in item:
+            del item["text"]
+            modified = True
+
+    if modified:
+        return json.dumps(data, ensure_ascii=False, indent=2)
+    return content
+
+
+def _apply_context_reduce(messages: list[dict]) -> list[dict]:
+    """Apply context reduction to historical tool messages.
+
+    Finds the last batch of consecutive tool messages (current turn) and keeps them intact.
+    All earlier tool messages have their 'text' field removed from results[].
+    """
+    if not messages:
+        return messages
+
+    last_tool_batch_start = None
+    i = len(messages) - 1
+
+    while i >= 0 and messages[i].get("role") != "tool":
+        i -= 1
+
+    if i < 0:
+        return messages
+
+    last_tool_batch_start = i
+    while (
+        last_tool_batch_start > 0
+        and messages[last_tool_batch_start - 1].get("role") == "tool"
+    ):
+        last_tool_batch_start -= 1
+
+    tool_call_id_to_name: dict[str, str] = {}
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        tool_calls = msg.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            tool_call_id = tc.get("id")
+            function = tc.get("function")
+            if not isinstance(tool_call_id, str) or not isinstance(function, dict):
+                continue
+            tool_name = function.get("name")
+            if isinstance(tool_name, str):
+                tool_call_id_to_name[tool_call_id] = tool_name
+
+    for j in range(last_tool_batch_start):
+        msg = messages[j]
+        if msg.get("role") == "tool":
+            tool_call_id = msg.get("tool_call_id")
+            if not isinstance(tool_call_id, str):
+                continue
+            if tool_call_id_to_name.get(tool_call_id) != "get_content":
+                continue
+            content = msg.get("content")
+            if isinstance(content, str):
+                msg["content"] = _reduce_tool_message_content(content)
+
+    return messages
+
+
 class StepStatus(str, Enum):
     """The state of the end of a step"""
-
     USER = "USER"
     FINISHED = "FINISHED"
     CONTINUE = "CONTINUE"
@@ -55,7 +142,6 @@ class ActionStepError:
     The most important purpose of this class is to provide a way to mark the error during action step.
     It can be used to implement the retry mechanism and `continue` method of `Runner`.
     """
-
     message: str
     source: Literal["llm"] = "llm"
 
@@ -175,27 +261,27 @@ class MemoryAgent:
         last_turn = self._last_turn()
         last_turn.steps.append(action_step)
         return last_turn
-
+ 
     def to_message(
         self, is_claude_thinking: bool = False, default_system_prompt_insert: str = ""
     ) -> list[dict]:
         """Convert the memory into messages for model.
-
-        Reference of format: https://platform.openai.com/docs/guides/function-calling?api-mode=chat
-        """
+ 
+         Reference of format: https://platform.openai.com/docs/guides/function-calling?api-mode=chat
+         """
         messages = []
-
+ 
         def maybe_insert_reasoning_fields(m: dict, step: ActionStep) -> None:
             if step.reasoning_details is not None:
                 m["reasoning_details"] = step.reasoning_details
             elif step.reasoning_content:
                 m["reasoning_content"] = step.reasoning_content
-
+ 
         if self.system_instructions:
             system_prompt = self.system_instructions
             if default_system_prompt_insert:
                 system_prompt = default_system_prompt_insert + "\n" + system_prompt
-
+ 
             messages.append(
                 {
                     "role": "system",
@@ -214,12 +300,12 @@ class MemoryAgent:
                 elif isinstance(step, ActionStep):
                     if step.error_marker:
                         continue
-
+ 
                     if step.tool_calls:
                         assert step.tool_call_results and len(
                             step.tool_call_results
                         ) == len(step.tool_calls)
-
+ 
                         m_tc = {
                             "role": "assistant",
                             "content": step.content,
@@ -238,7 +324,7 @@ class MemoryAgent:
                                 }
                             )
                         messages.append(m_tc)
-
+ 
                         for tcr in step.tool_call_results:
                             m_tcr = {
                                 "role": "tool",
@@ -246,9 +332,10 @@ class MemoryAgent:
                                 "tool_call_id": tcr.tool_call_id,
                             }
                             messages.append(m_tcr)
-
+ 
                     else:
                         m = {"role": "assistant", "content": step.content}
                         maybe_insert_reasoning_fields(m, step)
                         messages.append(m)
+        messages = _apply_context_reduce(messages)
         return messages
